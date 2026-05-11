@@ -1,40 +1,33 @@
 """
 aggregation.py — Hidden-state aggregation and geometric feature extraction.
 
-Per the README, applicants are explicitly encouraged to add hand-crafted
-features "during the aggregation step, drawing on geometrical or topological
-methods".  Since ``USE_GEOMETRIC`` in ``solution.py`` is part of the fixed
-infrastructure (only ``aggregation.py``, ``probe.py``, ``splitting.py`` may
-be edited), every feature in this file is produced inside ``aggregate``.
-``extract_geometric_features`` is left as a documented hook returning an
-empty tensor — flipping ``USE_GEOMETRIC`` has no effect either way.
+Strategy
+--------
+With ~440 training samples and a 896-dim hidden state, packing many layers into
+a single 7000+ dim vector and feeding it to one classifier leads to severe
+over-fitting (train AUROC 100%, test AUROC ~72% in the previous run).
 
-What the probe sees
--------------------
-For each sample the feature vector is the concatenation of:
+The new layout keeps **predictable per-layer / per-pool slices** so the probe in
+``probe.py`` can train a *separate* tiny logistic regression on each slice and
+ensemble the results.  Each sub-probe only sees 896 features and 440 samples —
+a much healthier ratio than 7252 features and 440 samples.
 
-A. Dense per-layer pooled embeddings ── ``len(SELECTED_LAYERS) * 2 * hidden_dim``
-   * Last real-token hidden state at each selected mid-to-late layer
-     (causal-attention summary at the end of the response).
-   * Mean over the last K real tokens at each selected layer
-     (response-region pool — averages out single-token noise).
-   This is the SAPLMA / mass-mean line of work (Azaria & Mitchell 2023;
-   Marks & Tegmark 2023).  Mid-to-late layers are picked because the
-   "truthfulness direction" in decoder LMs is concentrated there.
+Feature vector layout
+---------------------
+For each layer L in ``SELECTED_LAYERS`` we emit two 896-dim pooled views:
+  * last real-token hidden state (causal-attention summary at the end of the
+    assistant response).
+  * mean over the last K real tokens at L (response-region pool).
 
-B. Geometric / spectral descriptors ── ~84 features
-   * Per-layer L2 norm of the last real token (25 features).
-   * Inter-layer cosine drift of the last token (24 features).
-   * Token-norm statistics in the response tail at the final layer.
-   * Token-to-token cosine drift in the tail.
-   * EigenScore-style features: top-k singular values of the centred
-     response-tail state matrix, plus log-determinant proxy and effective
-     rank — at four upper layers (INSIDE; Chen et al. ICLR 2024).
-   * Real-token sequence length.
+Then we append a compact block of geometric / spectral descriptors (~84 dims).
+``SLICE_LAYOUT`` (exported below) maps every slice to its position in the flat
+vector, so the probe knows exactly which feature dimensions belong to which
+layer/pool.  This module-level metadata is the only "fixed-infrastructure-
+compatible" way to share structure with ``probe.py``.
 
-For ``Qwen/Qwen2.5-0.5B`` (24 transformer layers + 1 embedding,
-hidden_dim=896, ``SELECTED_LAYERS = (12, 16, 20, 24)``) the resulting
-feature dim is 4 * 2 * 896 + 84 = 7252.
+For ``Qwen/Qwen2.5-0.5B`` (24 transformer layers + 1 embedding, hidden_dim=896,
+``SELECTED_LAYERS = (8,10,12,14,16,18,20,22,24)``) the resulting feature dim is
+9 * 2 * 896 + 84 = 16212.
 """
 
 from __future__ import annotations
@@ -44,30 +37,60 @@ import torch
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-# Qwen2.5-0.5B has 24 transformer layers; outputs.hidden_states returns 25
-# tensors (embedding + 24 layers).  Indexing matches solution.py:
-#     hidden_states[0]  -> token embeddings
-#     hidden_states[L]  -> after transformer layer L  (L = 1, ..., 24)
-#     hidden_states[-1] -> final transformer layer
-SELECTED_LAYERS = (12, 16, 20, 24)
+# Sample every other layer in the mid-to-late stack — that is where the
+# "truthfulness direction" emerges in decoder LMs (Azaria & Mitchell 2023,
+# Marks & Tegmark 2023).  More layers => more ensemble diversity for the
+# per-layer linear probes in probe.py, without runtime cost.
+SELECTED_LAYERS: tuple[int, ...] = (8, 10, 12, 14, 16, 18, 20, 22, 24)
 
 # Number of trailing real tokens treated as the response region for mean
 # pooling and spectral analysis.
 RESPONSE_TAIL_K = 64
 
-# Layers used for geometric eigen-features (top of the stack — strongest
-# hallucination signal in 24-layer decoder LMs).
+# Layers used for geometric eigen-features (top of the stack).
 GEO_LAYERS = (18, 20, 22, 24)
-
-# Top-K singular values kept per geometric layer.
 GEO_TOP_SV = 5
+
+# Qwen2.5-0.5B hidden dim — used to declare slice sizes up front.
+HIDDEN_DIM = 896
+
+# Pool names (kept stable so probe.py can iterate over them).
+POOLS: tuple[str, ...] = ("last", "mean")
+
+
+# ---------------------------------------------------------------------------
+# Slice layout — shared with probe.py
+# ---------------------------------------------------------------------------
+def _build_slice_layout() -> list[dict]:
+    """Return per-slice metadata: name, start, end indices in the flat vector.
+
+    Layout: [layer8_last, layer8_mean, layer10_last, layer10_mean, ..., GEO]
+    """
+    layout: list[dict] = []
+    cur = 0
+    for L in SELECTED_LAYERS:
+        for pool in POOLS:
+            layout.append(
+                {
+                    "name": f"L{L}_{pool}",
+                    "layer": L,
+                    "pool": pool,
+                    "start": cur,
+                    "end": cur + HIDDEN_DIM,
+                }
+            )
+            cur += HIDDEN_DIM
+    return layout
+
+
+SLICE_LAYOUT: list[dict] = _build_slice_layout()
+GEO_START: int = SLICE_LAYOUT[-1]["end"]   # everything past this is geo features
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def _safe_cosine(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Cosine similarity between two 1-D tensors, robust to zero norm."""
     return torch.dot(a, b) / (a.norm().clamp_min(eps) * b.norm().clamp_min(eps))
 
 
@@ -76,16 +99,16 @@ def _pooled_features(
     real_idx: torch.Tensor,
     last_pos: int,
 ) -> list[torch.Tensor]:
-    """Last-token + mean-tail pool at each selected layer."""
+    """last-token + mean-tail pool at each selected layer, in SLICE_LAYOUT order."""
     n_real = int(real_idx.numel())
     tail_n = min(RESPONSE_TAIL_K, n_real)
     tail_pos = real_idx[-tail_n:]
 
     feats: list[torch.Tensor] = []
-    for layer_idx in SELECTED_LAYERS:
-        layer = hidden_states[layer_idx]                  # (seq_len, hidden_dim)
-        feats.append(layer[last_pos])                     # last-token pool
-        feats.append(layer.index_select(0, tail_pos).mean(dim=0))  # tail-mean pool
+    for L in SELECTED_LAYERS:
+        layer = hidden_states[L]                              # (seq_len, hidden_dim)
+        feats.append(layer[last_pos])                          # last-token
+        feats.append(layer.index_select(0, tail_pos).mean(0))  # tail-mean
     return feats
 
 
@@ -94,7 +117,7 @@ def _geometric_features(
     real_idx: torch.Tensor,
     last_pos: int,
 ) -> list[torch.Tensor]:
-    """Hand-crafted geometric / spectral descriptors."""
+    """Hand-crafted geometric / spectral descriptors (~84 features)."""
     device = hidden_states.device
     n_layers_total = hidden_states.size(0)
     n_real = int(real_idx.numel())
@@ -139,8 +162,6 @@ def _geometric_features(
         feats.append(torch.zeros(2, device=device))
 
     # (5) EigenScore-style spectral features per upper layer.
-    # For each layer, take the response-tail states (tail_n x h), centre them,
-    # run SVD, and keep top-k singular values + log-det proxy + effective rank.
     sv_per_layer: list[torch.Tensor] = []
     log_det_proxy: list[torch.Tensor] = []
     eff_rank: list[torch.Tensor] = []
@@ -184,23 +205,12 @@ def aggregate(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Build the full feature vector: dense pooled embeddings + geometric stats.
-
-    Args:
-        hidden_states:  ``(n_layers + 1, seq_len, hidden_dim)``.
-        attention_mask: ``(seq_len,)`` with 1 for real tokens, 0 for padding.
-
-    Returns:
-        Flat tensor of length
-        ``len(SELECTED_LAYERS) * 2 * hidden_dim + ~84 (geo)`` = 7252 for
-        Qwen2.5-0.5B.
-    """
+    """Build the full feature vector: dense pooled embeddings + geometric stats."""
     device = hidden_states.device
     mask = attention_mask.to(device=device, dtype=torch.bool)
 
     real_idx = mask.nonzero(as_tuple=False).squeeze(-1)
     if real_idx.numel() == 0:
-        # Degenerate sample; fall back to position 0 to keep shapes consistent.
         real_idx = torch.tensor([0], device=device)
     last_pos = int(real_idx[-1].item())
 
@@ -208,7 +218,6 @@ def aggregate(
     geo = _geometric_features(hidden_states, real_idx, last_pos)
 
     out = torch.cat([t.reshape(-1) for t in pooled + geo], dim=0).float()
-    # Replace any NaN/Inf with zeros so the probe never sees garbage.
     out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     return out
 
@@ -217,14 +226,7 @@ def extract_geometric_features(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Hook kept for interface compatibility with ``solution.py``.
-
-    All geometric / spectral features are produced inside ``aggregate``
-    above so they are always included regardless of the value of
-    ``USE_GEOMETRIC`` in ``solution.py`` (which is part of the fixed
-    infrastructure and cannot be edited).  This function therefore returns
-    an empty tensor and the value of ``USE_GEOMETRIC`` is irrelevant.
-    """
+    """All geometric features are emitted inside ``aggregate``."""
     return torch.zeros(0, device=hidden_states.device)
 
 
@@ -233,15 +235,9 @@ def aggregation_and_feature_extraction(
     attention_mask: torch.Tensor,
     use_geometric: bool = False,
 ) -> torch.Tensor:
-    """Concatenate ``aggregate`` output with the (empty) geometric hook.
-
-    The ``use_geometric`` flag is accepted for backward compatibility but has
-    no effect: geometric features are already included by ``aggregate``.
-    """
+    """Concatenate ``aggregate`` output with the (empty) geometric hook."""
     agg_features = aggregate(hidden_states, attention_mask)
-
     if use_geometric:
         geo_features = extract_geometric_features(hidden_states, attention_mask)
         return torch.cat([agg_features, geo_features], dim=0)
-
     return agg_features
