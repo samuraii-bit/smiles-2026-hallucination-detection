@@ -41,7 +41,7 @@ import torch
 # "truthfulness direction" emerges in decoder LMs (Azaria & Mitchell 2023,
 # Marks & Tegmark 2023).  More layers => more ensemble diversity for the
 # per-layer linear probes in probe.py, without runtime cost.
-SELECTED_LAYERS: tuple[int, ...] = (8, 10, 12, 14, 16, 18, 20, 22, 24)
+SELECTED_LAYERS: tuple[int, ...] = (4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 23, 24)
 
 # Number of trailing real tokens treated as the response region for mean
 # pooling and spectral analysis.
